@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "字幕转语音同步器",
+  "version": "1.0",
+  "description": "将字幕转换为语音并同步视频播放速度",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "unlimitedStorage",
+    "scripting",
+    "downloads"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"]
+    }
+  ],
+  "action": {}
+}
