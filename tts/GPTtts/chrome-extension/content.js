@@ -47,11 +47,18 @@ let lastPlayedSubtitleId = null; // 记录上一次已播放音频的字幕ID
 let isReload = false; // 是否重新加载字幕音频
 let isLearn = false; // 是否处于语言学习模式
 let pausedForSubtitleId = null; // 记录因等待哪个字幕音频而暂停的ID
+let batchLoadingCanceled = false; // 控制批量加载是否被取消
+let batchLoadingInProgress = false; // 标记是否正在进行批量加载
 
-// 查找视频元素
-const video = document.querySelector("video");
+// 将关键变量暴露到window对象中，便于调试和测试
+window.batchLoadingCanceled = batchLoadingCanceled;
+window.batchLoadingInProgress = batchLoadingInProgress;
+
+// 查找视频元素 - 支持动态加载
+let video = null;
 let subtitleBar = null;
 let currentLanguage = "zh"; // 默认中文
+let videoInitialized = false; // 标记视频是否已初始化
 
 // 从storage获取语言设置
 chrome.storage.sync.get(["language"], (result) => {
@@ -67,13 +74,50 @@ chrome.storage.onChanged.addListener((changes, namespace) => {
   }
 });
 
-// 页面加载时创建 UI 元素
-createPopup();
-if (!video) {
-  console.log("No video element found");
-} else {
-  // 创建字幕栏
-  subtitleBar = createSubtitleBar();
+// 动态查找视频元素的函数
+function findVideoElement() {
+  // 尝试多种选择器，适配不同网站的视频结构
+  const selectors = [
+    'video', // 标准video元素
+    '.bwp-video video', // Bilibili专用
+    '.bilibili-player-video video', // Bilibili播放器
+    '.player-video video', // 通用播放器
+    '[data-video] video', // 带data-video属性的容器中的视频
+  ];
+  
+  for (const selector of selectors) {
+    const foundVideo = document.querySelector(selector);
+    if (foundVideo && foundVideo.readyState >= 1) { // 确保视频有数据
+      console.log(`找到视频元素: ${selector}`);
+      return foundVideo;
+    }
+  }
+  return null;
+}
+
+// 初始化视频相关功能
+function initializeVideo(videoElement) {
+  if (videoInitialized && video === videoElement) {
+    return; // 避免重复初始化同一个视频元素
+  }
+  
+  video = videoElement;
+  videoInitialized = true;
+  
+  console.log("初始化视频元素及相关功能");
+  
+  // 创建字幕栏（仅在检测到视频时创建）
+  if (subtitleBar) {
+    subtitleBar.remove(); // 移除旧的字幕栏
+    subtitleBar = null;
+  }
+  
+  // 检测到视频元素时才创建字幕栏
+  if (video) {
+    subtitleBar = createSubtitleBar();
+  } else {
+    console.log("未检测到视频元素，不创建字幕栏");
+  }
 
   // 监听播放速率变化
   video.addEventListener("ratechange", () => {
@@ -84,7 +128,8 @@ if (!video) {
       }
     }
   });
-  // 监听视频播放进度 (仅当视频存在时)
+  
+  // 监听视频播放进度
   video.addEventListener("timeupdate", () => {
     const currentTime = video.currentTime;
     const currentSubtitleIndex = subtitles.findIndex(
@@ -157,28 +202,208 @@ if (!video) {
       // 不在此处自动暂停视频，除非有明确需求
     }
   });
+  
+  // 监听窗口大小变化和视频尺寸变化重新定位字幕栏
+  window.addEventListener("resize", () => {
+    if (subtitleBar) positionSubtitleBar();
+  });
 
-  // 已移除主播放按钮相关逻辑
+  // 监听视频大小变化
+  const resizeObserver = new ResizeObserver(() => {
+    if (subtitleBar) positionSubtitleBar();
+  });
+  resizeObserver.observe(video);
+  
+  // 视频初始化完成后，如果浮动按钮存在且没有自定义位置，重新定位到视频左上角
+  if (floatingControlBtn) {
+    chrome.storage.local.get(["floatingBtnPos"], (result) => {
+      if (!result.floatingBtnPos) {
+        console.log("Video initialized, repositioning floating button to video top-left");
+        setDefaultFloatingButtonPosition(floatingControlBtn);
+      }
+    });
+  }
 }
+
+// 设置视频检测和重试机制
+function setupVideoDetection() {
+  let retryCount = 0;
+  const maxRetries = 10;
+  const retryInterval = 1000; // 1秒
+
+  function checkForVideo() {
+    const foundVideo = findVideoElement();
+    if (foundVideo) {
+      initializeVideo(foundVideo);
+      return;
+    }
+    
+    retryCount++;
+    if (retryCount < maxRetries) {
+      console.log(`未找到视频元素，${retryInterval/1000}秒后重试 (${retryCount}/${maxRetries})`);
+      setTimeout(checkForVideo, retryInterval);
+    } else {
+      console.log("达到最大重试次数，停止查找视频元素");
+    }
+  }
+
+  // 立即检查一次
+  checkForVideo();
+
+  // 设置DOM变化监听器
+  const observer = new MutationObserver((mutations) => {
+    if (video) return; // 如果已找到视频，停止监听
+    
+    // 检查是否有新的video元素被添加
+    for (const mutation of mutations) {
+      if (mutation.type === 'childList') {
+        for (const node of mutation.addedNodes) {
+          if (node.nodeType === Node.ELEMENT_NODE) {
+            // 检查新添加的节点是否包含video元素
+            if (node.tagName === 'VIDEO' || node.querySelector('video')) {
+              const foundVideo = findVideoElement();
+              if (foundVideo) {
+                initializeVideo(foundVideo);
+                observer.disconnect(); // 停止观察
+                return;
+              }
+            }
+          }
+        }
+      }
+    }
+  });
+
+  // 开始观察DOM变化
+  observer.observe(document.body, {
+    childList: true,
+    subtree: true
+  });
+}
+
+// 页面加载时创建 UI 元素
+function initializeUI() {
+  console.log("Initializing UI. Document ready state:", document.readyState);
+  console.log("Document body exists:", !!document.body);
+  
+  if (!document.body) {
+    console.log("Document body not ready, waiting...");
+    setTimeout(initializeUI, 100);
+    return;
+  }
+  
+  console.log("Creating popup and floating button...");
+  createPopup();
+  floatingControlBtn = createFloatingButton();
+  console.log("Floating button created:", floatingControlBtn);
+}
+
+// 确保DOM准备就绪后再初始化UI
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initializeUI);
+} else {
+  initializeUI();
+}
+
+// 启动视频检测
+setupVideoDetection();
+
+// 添加视频位置变化监听器
+function setupFloatingButtonRepositioning() {
+  // 当窗口大小变化或滚动时，如果没有保存的自定义位置，重新定位到视频左上角
+  function repositionIfNeeded() {
+    if (floatingControlBtn) {
+      // 检查是否使用的是默认位置（没有保存的自定义位置）
+      chrome.storage.local.get(["floatingBtnPos"], (result) => {
+        if (!result.floatingBtnPos) {
+          // 只有在没有自定义位置时才重新定位
+          setDefaultFloatingButtonPosition(floatingControlBtn);
+        }
+      });
+    }
+  }
+  
+  // 监听窗口大小变化
+  window.addEventListener('resize', repositionIfNeeded);
+  
+  // 监听滚动事件（节流处理）
+  let scrollTimeout;
+  window.addEventListener('scroll', () => {
+    clearTimeout(scrollTimeout);
+    scrollTimeout = setTimeout(repositionIfNeeded, 100);
+  });
+  
+  console.log("Floating button repositioning listeners added");
+}
+
+setupFloatingButtonRepositioning();
 
 // 创建字幕栏元素
 // 定位字幕栏函数
 function positionSubtitleBar() {
   // 确保 subtitleBar 和 video 变量在此作用域可用
-  // 假设 subtitleBar 和 video 是全局变量或在调用此函数前已定义
   if (video && subtitleBar) {
-    const videoRect = video.getBoundingClientRect();
+    // 检测是否处于全屏状态
+    const isFullscreen = !!(document.fullscreenElement || document.webkitFullscreenElement || 
+                            document.mozFullScreenElement || document.msFullscreenElement);
+    
+    console.log(`定位字幕栏 - 全屏状态: ${isFullscreen}`);
+    
+    if (isFullscreen) {
+      // 全屏模式：确保字幕栏被添加到全屏元素中
+      const fullscreenElement = document.fullscreenElement || document.webkitFullscreenElement || 
+                               document.mozFullScreenElement || document.msFullscreenElement;
+      
+      if (fullscreenElement && subtitleBar.parentNode !== fullscreenElement) {
+        // 将字幕栏移动到全屏元素中
+        fullscreenElement.appendChild(subtitleBar);
+        console.log('字幕栏已移动到全屏元素中');
+      }
+      
+      // 全屏模式：调整z-index确保字幕在全屏视频上方显示
+      subtitleBar.style.position = "absolute";
+      subtitleBar.style.zIndex = "999999";
+      
+      // 全屏时，将字幕栏定位在屏幕底部上方50px位置
+      const subtitleBarHeight = subtitleBar.offsetHeight || 100;
+      subtitleBar.style.top = `${window.innerHeight - 50 - subtitleBarHeight}px`;
+      
+      // 全屏时字幕栏宽度为屏幕宽度的90%
+      const subtitleBarWidth = window.innerWidth * 0.9;
+      const left = (window.innerWidth - subtitleBarWidth) / 2;
+      
+      subtitleBar.style.width = `${subtitleBarWidth}px`;
+      subtitleBar.style.left = `${left}px`;
+      
+      console.log(`全屏模式字幕栏定位: 宽度=${subtitleBarWidth}px, 左边距=${left}px, 顶部=${subtitleBar.style.top}`);
+    } else {
+      // 退出全屏时，将字幕栏移回视频的父容器
+      const videoParent = video.parentElement || document.body;
+      if (subtitleBar.parentNode !== videoParent) {
+        videoParent.appendChild(subtitleBar);
+        console.log('字幕栏已移回视频父容器');
+      }
+      
+      // 普通模式：相对于视频位置定位
+      subtitleBar.style.position = "fixed";
+      subtitleBar.style.zIndex = "9998";
+      
+      const videoRect = video.getBoundingClientRect();
+      
+      // 设置垂直位置：在视频底部上方50px处
+      const subtitleBarHeight = subtitleBar.offsetHeight || 100;
+      subtitleBar.style.top = `${videoRect.bottom - 50 - subtitleBarHeight}px`;
 
-    // 设置垂直位置：在视频下方10px处
-    subtitleBar.style.top = `${videoRect.bottom + 10}px`;
+      // 设置水平位置：相对视频宽度居中，宽度为视频宽度的90%
+      const subtitleBarWidth = videoRect.width * 0.9;
+      const left = videoRect.left + (videoRect.width - subtitleBarWidth) / 2;
 
-    // 设置水平位置：相对视频宽度居中
-    const subtitleBarWidth = Math.min(videoRect.width * 0.8, 600); // 字幕栏宽度为视频宽度的80%，最大600px
-    const left = videoRect.left + (videoRect.width - subtitleBarWidth) / 2;
-
-    // 更新字幕栏样式
-    subtitleBar.style.width = `${subtitleBarWidth}px`;
-    subtitleBar.style.left = `${left}px`;
+      subtitleBar.style.width = `${subtitleBarWidth}px`;
+      subtitleBar.style.left = `${left}px`;
+      
+      console.log(`普通模式字幕栏定位: 宽度=${subtitleBarWidth}px, 左边距=${left}px, 顶部=${subtitleBar.style.top}`);
+    }
+    
     subtitleBar.style.transform = "none"; // 移除之前的transform
     subtitleBar.style.bottom = "auto"; // 清除bottom属性
   }
@@ -193,8 +418,8 @@ function createSubtitleBar() {
   subtitleBar.style.padding = "10px";
   subtitleBar.style.borderRadius = "5px";
   subtitleBar.style.fontFamily = "Arial, sans-serif";
-  subtitleBar.style.width = "80%";
-  subtitleBar.style.maxWidth = "600px";
+  subtitleBar.style.width = "auto"; // 初始宽度设为auto，由positionSubtitleBar函数动态设置
+  subtitleBar.style.maxWidth = "none"; // 移除最大宽度限制
   subtitleBar.style.minWidth = "300px";
   subtitleBar.style.display = "grid";
   subtitleBar.style.gridTemplateRows = "auto auto auto";
@@ -270,12 +495,12 @@ function createSubtitleBar() {
   const subtitleLine1 = document.createElement("div");
   subtitleLine1.id = "subtitle-line1";
   subtitleLine1.style.textAlign = "center";
-  subtitleLine1.style.fontSize = "1.1em";
+  subtitleLine1.style.fontSize = "2em";
 
   const subtitleLine2 = document.createElement("div");
   subtitleLine2.id = "subtitle-line2";
   subtitleLine2.style.textAlign = "center";
-  subtitleLine2.style.fontSize = "1.1em";
+  subtitleLine2.style.fontSize = "2em";
 
   subtitleBar.appendChild(speedRow);
   subtitleBar.appendChild(subtitleLine1);
@@ -371,7 +596,41 @@ function createSubtitleBar() {
   });
 
   document.body.appendChild(subtitleBar);
+  
+  // 立即检查是否处于全屏状态，如果是则移动到全屏元素中
+  const isFullscreen = !!(document.fullscreenElement || document.webkitFullscreenElement || 
+                          document.mozFullScreenElement || document.msFullscreenElement);
+  if (isFullscreen) {
+    const fullscreenElement = document.fullscreenElement || document.webkitFullscreenElement || 
+                             document.mozFullScreenElement || document.msFullscreenElement;
+    if (fullscreenElement) {
+      fullscreenElement.appendChild(subtitleBar);
+      console.log('字幕栏创建时即移动到全屏元素中');
+    }
+  }
+  
+  // 添加全屏状态变化监听器
+  const fullscreenEvents = ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange'];
+  fullscreenEvents.forEach(eventName => {
+    document.addEventListener(eventName, () => {
+      console.log('全屏状态变化，重新定位字幕栏');
+      // 延迟执行以确保全屏转换完成
+      setTimeout(() => {
+        positionSubtitleBar();
+      }, 100);
+    });
+  });
+  
   positionSubtitleBar();
+  
+  // 检查隐藏字幕栏的状态
+  setTimeout(() => {
+    const hideSubtitleBarBtn = shadowRoot?.getElementById("hide-subtitle-bar");
+    if (hideSubtitleBarBtn && hideSubtitleBarBtn.checked && subtitleBar) {
+      subtitleBar.style.display = "none";
+    }
+  }, 100);
+  
   return subtitleBar;
 }
 
@@ -545,8 +804,10 @@ function createPopup() {
       <div class="controls">
         <button id="select-file">选择字幕文件</button>
         
-        <button id="play-audio-start">播放</button>
+        <button id="play-audio-start">从头播放</button>
         <button id="select-voice-config">更新语音配置</button>
+        <button id="batch-load-audio">加载音频</button>
+        <button id="stop-batch-load" style="display: none; background-color: #ff4444; color: white;">停止加载</button>
         
         <input type="file" id="voice-config-input" accept=".txt" style="display: none;">
       </div>
@@ -564,6 +825,11 @@ function createPopup() {
                <input type="checkbox" id="learn" name="learn">
                <label for="learn">跟读模式</label>
                <span class="help-icon" title="勾选后,将不再同步播放视频画面和字幕音频\n而是先播放字幕音频,然后播放原声,方便学习语言">(?)</span>
+             </div>
+             <div class="checkbox-container"> <!-- 新增：隐藏字幕栏选项 -->
+               <input type="checkbox" id="hide-subtitle-bar" name="hide-subtitle-bar">
+               <label for="hide-subtitle-bar">隐藏字幕栏</label>
+               <span class="help-icon" title="勾选后,将隐藏视频上方的字幕栏显示">(?)</span>
              </div>
       <div class="current-subtitle" id="current-subtitle"></div>
       <div class="list-header">
@@ -688,7 +954,10 @@ function createPopup() {
   });
   const isReloadBtn = shadowRoot.getElementById("myCheckbox"); // 从 shadowRoot 获取
   const isLearnBtn = shadowRoot.getElementById("learn"); // 从 shadowRoot 获取
+  const hideSubtitleBarBtn = shadowRoot.getElementById("hide-subtitle-bar"); // 获取隐藏字幕栏复选框
   const playAudioStartBtn = shadowRoot.getElementById("play-audio-start"); // 获取从头播放按钮
+  const batchLoadAudioBtn = shadowRoot.getElementById("batch-load-audio"); // 获取批量加载音频按钮
+  const stopBatchLoadBtn = shadowRoot.getElementById("stop-batch-load"); // 获取停止批量加载按钮
   const helpIcons = shadowRoot.querySelectorAll(".help-icon"); // 获取所有帮助图标
 
   // 从storage加载语音配置
@@ -773,6 +1042,21 @@ function createPopup() {
     });
   }
 
+  // 隐藏字幕栏复选框事件监听器
+  if (hideSubtitleBarBtn) {
+    hideSubtitleBarBtn.addEventListener("change", function () {
+      if (subtitleBar) {
+        if (this.checked) {
+          subtitleBar.style.display = "none";
+          console.log("字幕栏已隐藏");
+        } else {
+          subtitleBar.style.display = "grid";
+          console.log("字幕栏已显示");
+        }
+      }
+    });
+  }
+
   // 选择字幕文件 - 点击按钮触发隐藏的 input
   selectFileBtn.addEventListener("click", () => {
     fileInput.click(); // 触发文件选择对话框
@@ -830,7 +1114,9 @@ function createPopup() {
         // 停止主播放状态
         // 已移除主播放按钮相关逻辑
         stopCurrentAudio(); // 停止任何正在播放的音频
-        video.currentTime = subtitle.startTime; // 跳转视频时间
+        if (video) {
+          video.currentTime = subtitle.startTime; // 跳转视频时间
+        }
         playAudio(subtitle.audioUrl, subtitle.id, true); // true 表示是单句播放
       }
     }
@@ -861,8 +1147,8 @@ function createPopup() {
   });
 
   // 从头播放按钮点击事件
-  if (playAudioStartBtn && video) {
-    // 确保按钮和视频元素都存在
+  if (playAudioStartBtn) {
+    // 确保按钮元素存在
     playAudioStartBtn.addEventListener("click", () => {
       if (playAudioStartBtn.disabled) return; // 如果按钮是禁用的，则不执行操作
 
@@ -880,18 +1166,106 @@ function createPopup() {
         }
       }
 
-      video.currentTime = 0; // 将视频进度设置为 0
-      if (video.paused) {
-        // 如果视频已暂停
-        video.play(); // 开始播放
+      // 动态获取当前视频元素
+      const currentVideo = video || findVideoElement();
+      
+      if (currentVideo) {
+        console.log("执行从头播放操作");
+        currentVideo.currentTime = 0; // 将视频进度设置为 0
+        if (currentVideo.paused) {
+          // 如果视频已暂停
+          currentVideo.play().then(() => {
+            console.log("视频开始播放");
+          }).catch((error) => {
+            console.error("视频播放失败:", error);
+          });
+        }
+        console.log("视频时间已设置为0，当前时间:", currentVideo.currentTime);
+      } else {
+        console.warn("未找到视频元素，无法执行从头播放");
       }
+      
       stopCurrentAudio(); // 停止可能正在播放的字幕音频
       lastPlayedSubtitleId = null; // 重置上次播放ID，确保从头开始同步
     });
-  } else if (!video) {
-    console.warn("未找到视频元素，'从头播放'按钮功能受限。");
-  } else if (!playAudioStartBtn) {
+  } else {
     console.error("未能从 Shadow DOM 中找到 ID 为 'play-audio-start' 的按钮。");
+  }
+
+  // 批量加载音频按钮点击事件
+  if (batchLoadAudioBtn) {
+    batchLoadAudioBtn.addEventListener("click", () => {
+      if (subtitles.length === 0) {
+        alert("请先选择字幕文件");
+        return;
+      }
+      
+      if (batchLoadingInProgress) {
+        alert("批量加载正在进行中，请等待或点击停止按钮");
+        return;
+      }
+      
+      // 重置取消标志
+      batchLoadingCanceled = false;
+      window.batchLoadingCanceled = false;
+      batchLoadingInProgress = true;
+      window.batchLoadingInProgress = true;
+      
+      // 更新UI状态
+      batchLoadAudioBtn.disabled = true;
+      batchLoadAudioBtn.textContent = "加载中...";
+      batchLoadAudioBtn.style.display = "none";
+      if (stopBatchLoadBtn) {
+        stopBatchLoadBtn.style.display = "inline-block";
+      }
+      
+      batchLoadAllAudios().then(() => {
+        // 加载完成，恢复UI状态
+        batchLoadingInProgress = false;
+        batchLoadAudioBtn.disabled = false;
+        batchLoadAudioBtn.textContent = "加载音频";
+        batchLoadAudioBtn.style.display = "inline-block";
+        if (stopBatchLoadBtn) {
+          stopBatchLoadBtn.style.display = "none";
+        }
+        
+        if (batchLoadingCanceled) {
+          console.log("批量加载已被用户取消");
+        } else {
+          console.log("所有音频加载完成");
+        }
+      }).catch((error) => {
+        // 加载出错，恢复UI状态
+        batchLoadingInProgress = false;
+        batchLoadAudioBtn.disabled = false;
+        batchLoadAudioBtn.textContent = "加载音频";
+        batchLoadAudioBtn.style.display = "inline-block";
+        if (stopBatchLoadBtn) {
+          stopBatchLoadBtn.style.display = "none";
+        }
+        console.error("批量加载音频出错:", error);
+        alert("批量加载音频过程中出现错误");
+      });
+    });
+  }
+
+  // 停止批量加载按钮点击事件
+  if (stopBatchLoadBtn) {
+    stopBatchLoadBtn.addEventListener("click", () => {
+      if (batchLoadingInProgress) {
+        batchLoadingCanceled = true;
+        console.log("用户请求停止批量加载");
+        
+        // 立即更新UI状态
+        batchLoadingInProgress = false;
+        batchLoadAudioBtn.disabled = false;
+        batchLoadAudioBtn.textContent = "加载音频";
+        batchLoadAudioBtn.style.display = "inline-block";
+        stopBatchLoadBtn.style.display = "none";
+        
+        alert("批量加载已停止");
+      }
+    });
   }
 
   // --- 实现拖拽功能 ---
@@ -924,7 +1298,7 @@ function createPopup() {
     newLeft = Math.max(0, Math.min(newLeft, maxLeft));
 
     popupDiv.style.top = `${newTop}px`;
-    popupDiv.style.left = `${newLeft}px`; // 修改 left 属性
+    popupDiv.style.left = newLeft + "px"; // 修改 left 属性
     popupDiv.style.right = "auto"; // 清除 right 属性，避免冲突
   });
 
@@ -1008,47 +1382,9 @@ function parseSubtitleFile(content) {
     result.push(currentSub);
   }
 
-  // 优化字幕：将中文字符数少于8的片段合并到相邻较短的字幕上，并处理时间戳
+  // 字幕处理函数 - 已移除中文字幕合并优化逻辑
   function optimizeSubtitles(subs) {
-    // 统计中文字符数
-    function countChinese(str) {
-      return (str.match(/[\u4e00-\u9fa5]/g) || []).length;
-    }
-    let i = 0;
-    while (i < subs.length) {
-      if (countChinese(subs[i].text) < 8) {
-        // 选择合并方向：与前一个或后一个较短的字幕合并
-        let mergeToPrev = false;
-        if (i === 0 && subs.length > 1) {
-          mergeToPrev = false;
-        } else if (i === subs.length - 1 && subs.length > 1) {
-          mergeToPrev = true;
-        } else if (subs.length > 2) {
-          // 比较前后字幕的中文字符数，合并到较短的那个
-          const prevLen = countChinese(subs[i - 1]?.text || "");
-          const nextLen = countChinese(subs[i + 1]?.text || "");
-          mergeToPrev = prevLen <= nextLen;
-        }
-        if (mergeToPrev && i > 0) {
-          // 合并到前一个
-          subs[i - 1].text += "\n" + subs[i].text;
-          subs[i - 1].endTime = subs[i].endTime;
-          subs.splice(i, 1);
-          i--; // 回退检查合并后的片段
-        } else if (!mergeToPrev && i < subs.length - 1) {
-          // 合并到后一个
-          subs[i + 1].text = subs[i].text + "\n" + subs[i + 1].text;
-          subs[i + 1].startTime = subs[i].startTime;
-          subs.splice(i, 1);
-          // 不回退，继续检查当前位置
-        } else {
-          i++;
-        }
-      } else {
-        i++;
-      }
-    }
-    // 重新编号
+    // 仅保留重新编号逻辑
     subs.forEach((sub, idx) => {
       sub.id = (idx + 1).toString();
     });
@@ -1145,23 +1481,286 @@ function updateCurrentSubtitleDisplay(text) {
   }
 }
 
-// 监听窗口大小变化和视频尺寸变化重新定位字幕栏
-window.addEventListener("resize", () => {
-  if (subtitleBar) positionSubtitleBar();
-});
-
-// 监听视频大小变化
-if (video) {
-  const resizeObserver = new ResizeObserver(() => {
-    if (subtitleBar) positionSubtitleBar();
-  });
-  resizeObserver.observe(video);
-}
-
 // --- 新增和修改的音频处理函数 ---
 
-// 并发加载所有字幕的音频
-// 已移除 loadAllAudios 批量加载函数
+// 批量加载所有字幕的音频
+async function batchLoadAllAudios() {
+  console.log("开始批量加载音频，总数:", subtitles.length);
+  
+  // 筛选出需要加载的字幕
+  const subtitlesToLoad = subtitles.filter(subtitle => {
+    if (subtitle.audioStatus === "loaded" && !isReload) {
+      console.log(`字幕 ${subtitle.id} 音频已存在，跳过`);
+      return false;
+    }
+    return true;
+  });
+  
+  console.log(`实际需要加载的音频数量: ${subtitlesToLoad.length}`);
+  
+  // 每批并发处理5个音频
+  const batchSize = 5;
+  const totalBatches = Math.ceil(subtitlesToLoad.length / batchSize);
+  
+  for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+    // 检查是否被取消
+    if (batchLoadingCanceled) {
+      console.log(`批量加载在第 ${batchIndex + 1} 批时被取消`);
+      throw new Error("批量加载被用户取消");
+    }
+    
+    const startIndex = batchIndex * batchSize;
+    const endIndex = Math.min(startIndex + batchSize, subtitlesToLoad.length);
+    const currentBatch = subtitlesToLoad.slice(startIndex, endIndex);
+    
+    console.log(`正在处理第 ${batchIndex + 1}/${totalBatches} 批，包含 ${currentBatch.length} 个音频`);
+    
+    // 并发加载当前批次的所有音频
+    const batchPromises = currentBatch.map(async (subtitle, index) => {
+      // 在每个音频加载前再次检查取消标志
+      if (batchLoadingCanceled) {
+        throw new Error("批量加载被用户取消");
+      }
+      
+      const globalIndex = startIndex + index + 1;
+      console.log(`正在加载第 ${globalIndex}/${subtitlesToLoad.length} 个音频: ${subtitle.id}`);
+      
+      try {
+        await loadAudioAsync(subtitle);
+        console.log(`字幕 ${subtitle.id} 音频加载完成`);
+        return { success: true, id: subtitle.id };
+      } catch (error) {
+        console.error(`字幕 ${subtitle.id} 音频加载失败:`, error);
+        return { success: false, id: subtitle.id, error };
+      }
+    });
+    
+    // 等待当前批次的所有音频加载完成
+    const batchResults = await Promise.all(batchPromises);
+    
+    // 统计当前批次的结果
+    const successCount = batchResults.filter(result => result.success).length;
+    const failCount = batchResults.filter(result => !result.success).length;
+    console.log(`第 ${batchIndex + 1} 批完成，成功: ${successCount}，失败: ${failCount}`);
+    
+    // 批次之间添加短暂延迟，避免服务器压力过大
+    if (batchIndex < totalBatches - 1) {
+      // 在延迟期间也检查取消标志
+      await new Promise(resolve => {
+        const timeoutId = setTimeout(() => {
+          if (batchLoadingCanceled) {
+            resolve();
+          } else {
+            resolve();
+          }
+        }, 200);
+        
+        // 如果被取消，立即解决Promise
+        if (batchLoadingCanceled) {
+          clearTimeout(timeoutId);
+          resolve();
+        }
+      });
+    }
+  }
+  
+  console.log("批量加载音频完成");
+}
+
+// 将 loadAudio 函数包装为 Promise 版本，用于批量加载
+function loadAudioAsync(subtitle) {
+  return new Promise((resolve, reject) => {
+    // 首先检查是否被取消
+    if (batchLoadingCanceled) {
+      reject(new Error("批量加载被用户取消"));
+      return;
+    }
+    
+    if (!subtitle) {
+      reject(new Error("字幕对象为空"));
+      return;
+    }
+
+    // 只有在音频未加载或强制重新生成时才进行加载
+    if (subtitle.audioStatus !== "unloaded" && !isReload) {
+      resolve();
+      return;
+    }
+
+    subtitle.audioStatus = "loading";
+    updateSubtitleStatusUI(subtitle.id, "loading");
+    console.log(`Requesting audio for subtitle: ${subtitle.id}`);
+
+    // 生成缓存key（用视频URL hash+字幕ID）
+    function hashCode(str) {
+      let hash = 0;
+      for (let i = 0; i < str.length; i++) {
+        hash = (hash << 5) - hash + str.charCodeAt(i);
+        hash |= 0;
+      }
+      return Math.abs(hash);
+    }
+    const videoKey =
+      typeof location !== "undefined" ? hashCode(location.href) : 0;
+    const cacheKey = `audio_${videoKey}_${subtitle.id}`;
+
+    // 先尝试读取chrome.storage.local缓存
+    chrome.storage.local.get([cacheKey], (result) => {
+      // 在回调中再次检查是否被取消
+      if (batchLoadingCanceled) {
+        subtitle.audioStatus = "unloaded"; // 恢复状态
+        updateSubtitleStatusUI(subtitle.id, "unloaded");
+        reject(new Error("批量加载被用户取消"));
+        return;
+      }
+      
+      const cachedBase64 = result[cacheKey];
+      if (
+        cachedBase64 &&
+        typeof cachedBase64 === "string" &&
+        cachedBase64.length > 0 &&
+        isReload === false // 仅在未勾选重新生成音频时使用缓存
+      ) {
+        // 命中缓存，直接用
+        try {
+          const audioBuffer = base64ToArrayBuffer(cachedBase64);
+          const audioBlob = new Blob([audioBuffer], { type: "audio/wav" });
+          const audioUrl = URL.createObjectURL(audioBlob);
+
+          subtitle.audioStatus = "loaded";
+          subtitle.audioUrl = audioUrl;
+
+          // 计算音频时长并计算播放速率
+          const tempAudio = new Audio(audioUrl);
+          tempAudio.onloadedmetadata = () => {
+            subtitle.audioDuration = tempAudio.duration;
+            const subtitleDuration = Math.max(
+              0.01,
+              subtitle.endTime - subtitle.startTime
+            );
+            if (subtitle.audioDuration && subtitle.audioDuration > 0) {
+              subtitle.playbackRate = subtitleDuration / subtitle.audioDuration;
+            } else {
+              subtitle.playbackRate = null;
+            }
+            updateSubtitleStatusUI(subtitle.id, "loaded");
+            resolve();
+          };
+          tempAudio.onerror = () => {
+            subtitle.audioDuration = null;
+            subtitle.playbackRate = null;
+            updateSubtitleStatusUI(subtitle.id, "loaded");
+            resolve();
+          };
+        } catch (e) {
+          console.error(
+            `Error decoding cached Base64 or creating Blob/URL for subtitle ${subtitle.id}:`,
+            e
+          );
+          subtitle.audioStatus = "failed";
+          updateSubtitleStatusUI(subtitle.id, "failed");
+          reject(e);
+        }
+      } else {
+        // 未命中缓存，调用接口生成并保存到chrome.storage.local
+        chrome.runtime.sendMessage(
+          {
+            action: "callGPTSoVITS",
+            text: subtitle.text.trim(),
+            language: "auto",
+            noCache: isReload, // 添加 noCache 标志，其值等于 isReload 的当前状态
+            ...(window.gptsoVitsParams || {}), // 添加已选择的语音参数
+          },
+          (response) => {
+            // 在回调开始时检查是否被取消
+            if (batchLoadingCanceled) {
+              subtitle.audioStatus = "unloaded"; // 恢复状态
+              updateSubtitleStatusUI(subtitle.id, "unloaded");
+              reject(new Error("批量加载被用户取消"));
+              return;
+            }
+            
+            if (chrome.runtime.lastError || (response && response.error)) {
+              console.error(
+                `Error loading audio for ${subtitle.id} (detected lastError or response.error):`,
+                chrome.runtime.lastError || response.error
+              );
+              subtitle.audioStatus = "failed";
+              updateSubtitleStatusUI(subtitle.id, "failed");
+              reject(new Error(chrome.runtime.lastError?.message || response.error));
+            } else if (
+              response &&
+              typeof response.audioBase64 === "string" &&
+              response.audioBase64.length > 0
+            ) {
+              // 保存到chrome.storage.local
+              const saveObj = {};
+              saveObj[cacheKey] = response.audioBase64;
+              chrome.storage.local.set(saveObj, () => {
+                if (chrome.runtime.lastError) {
+                  console.warn(
+                    `Failed to save audio to chrome.storage: ${cacheKey}`,
+                    chrome.runtime.lastError.message
+                  );
+                } else {
+                  console.log(`Audio saved to chrome.storage: ${cacheKey}`);
+                }
+              });
+              // 正常流程
+              try {
+                const audioBuffer = base64ToArrayBuffer(response.audioBase64);
+                const audioBlob = new Blob([audioBuffer], { type: "audio/wav" });
+                const audioUrl = URL.createObjectURL(audioBlob);
+
+                subtitle.audioStatus = "loaded";
+                subtitle.audioUrl = audioUrl;
+
+                // 计算音频时长并计算播放速率
+                const tempAudio = new Audio(audioUrl);
+                tempAudio.onloadedmetadata = () => {
+                  subtitle.audioDuration = tempAudio.duration;
+                  const subtitleDuration = Math.max(
+                    0.01,
+                    subtitle.endTime - subtitle.startTime
+                  );
+                  if (subtitle.audioDuration && subtitle.audioDuration > 0) {
+                    subtitle.playbackRate =
+                      subtitleDuration / subtitle.audioDuration;
+                  } else {
+                    subtitle.playbackRate = null;
+                  }
+                  updateSubtitleStatusUI(subtitle.id, "loaded");
+                  resolve();
+                };
+                tempAudio.onerror = () => {
+                  subtitle.audioDuration = null;
+                  subtitle.playbackRate = null;
+                  updateSubtitleStatusUI(subtitle.id, "loaded");
+                  resolve();
+                };
+              } catch (e) {
+                console.error(
+                  `Error decoding Base64 or creating Blob/URL for subtitle ${subtitle.id}:`,
+                  e
+                );
+                subtitle.audioStatus = "failed";
+                updateSubtitleStatusUI(subtitle.id, "failed");
+                reject(e);
+              }
+            } else {
+              console.error(
+                `Marking as failed due to invalid response (not error or valid Base64 string) for ${subtitle.id}. Full response logged above.`
+              );
+              subtitle.audioStatus = "failed";
+              updateSubtitleStatusUI(subtitle.id, "failed");
+              reject(new Error("Invalid response from audio generation service"));
+            }
+          }
+        );
+      }
+    });
+  });
+}
 
 // 加载单个字幕的音频
 function loadAudio(subtitle) {
@@ -1469,7 +2068,7 @@ function playAudio(audioUrl, subtitleId, isSinglePlay) {
         video.playbackRate = Number(targetRate.toFixed(2));
       }
     } else {
-      video.pause();
+      if (video) video.pause();
     }
   };
 
@@ -1498,7 +2097,7 @@ function playAudio(audioUrl, subtitleId, isSinglePlay) {
       video.pause(); // 单句播放结束时暂停视频
     }
     // 对于连续播放，不需要在这里处理，timeupdate 会找到下一个
-    if (isLearn) {
+    if (isLearn && video) {
       video.play(); // 语言学习模式下，音频结束后继续播放视频
     }
   };
@@ -1633,11 +2232,57 @@ function positionPopupRelativeToFloatingButton() {
   popupDiv.style.bottom = "auto";
 }
 
+// 设置浮动按钮的默认位置（视频左上角）
+function setDefaultFloatingButtonPosition(floatingBtn) {
+  // 使用现有的视频查找逻辑
+  const currentVideo = video || findVideoElement();
+  
+  if (currentVideo) {
+    try {
+      const videoRect = currentVideo.getBoundingClientRect();
+      // 获取视频元素相对于视口的位置
+      const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+      const scrollLeft = window.pageXOffset || document.documentElement.scrollLeft;
+      
+      // 计算视频左上角的绝对位置（考虑滚动）
+      const videoLeft = videoRect.left + scrollLeft + 10; // 向右偏移10px
+      const videoTop = videoRect.top + scrollTop + 10;   // 向下偏移10px
+      
+      // 设置浮动按钮位置
+      floatingBtn.style.left = `${videoLeft}px`;
+      floatingBtn.style.top = `${videoTop}px`;
+      floatingBtn.style.right = "auto";
+      floatingBtn.style.bottom = "auto";
+      
+      console.log(`Floating button positioned at video top-left: left=${videoLeft}px, top=${videoTop}px`);
+      console.log(`Video rect:`, videoRect);
+    } catch (error) {
+      console.warn("Error positioning floating button relative to video:", error);
+      // 如果出错，回退到右下角位置
+      setFallbackPosition(floatingBtn);
+    }
+  } else {
+    console.log("Video element not found, using fallback position");
+    setFallbackPosition(floatingBtn);
+  }
+}
+
+// 回退位置设置（右下角）
+function setFallbackPosition(floatingBtn) {
+  floatingBtn.style.right = "20px";
+  floatingBtn.style.bottom = "20px";
+  floatingBtn.style.left = "auto";
+  floatingBtn.style.top = "auto";
+  console.log("Fallback position set: right=20px, bottom=20px");
+}
+
 // 创建一个可移动的悬浮按钮控制所有UI元素
 function createFloatingButton() {
+  console.log("Creating floating button...");
   const localFloatingBtn = document.createElement("div"); // Use local var first
   localFloatingBtn.id = "floating-control-btn";
   localFloatingBtn.textContent = "🎭";
+  console.log("Floating button element created:", localFloatingBtn);
 
   // 默认样式
   const defaultStyle = {
@@ -1659,9 +2304,14 @@ function createFloatingButton() {
 
   // 应用默认样式
   Object.assign(localFloatingBtn.style, defaultStyle);
+  console.log("Default styles applied to floating button");
+
+  // 立即设置一个默认位置，避免异步问题
+  setDefaultFloatingButtonPosition(localFloatingBtn);
 
   // 从 storage 加载保存的位置
   chrome.storage.local.get(["floatingBtnPos"], (result) => {
+    console.log("Storage callback executed, saved position:", result.floatingBtnPos);
     if (
       result.floatingBtnPos &&
       result.floatingBtnPos.left !== undefined &&
@@ -1671,10 +2321,10 @@ function createFloatingButton() {
       localFloatingBtn.style.top = `${result.floatingBtnPos.top}px`;
       localFloatingBtn.style.right = "auto"; // 清除默认的 right 和 bottom
       localFloatingBtn.style.bottom = "auto";
+      console.log(`Position updated from storage: left=${result.floatingBtnPos.left}px, top=${result.floatingBtnPos.top}px`);
     } else {
-      // 如果没有保存的位置，使用默认右下角位置
-      localFloatingBtn.style.right = "20px";
-      localFloatingBtn.style.bottom = "20px";
+      // 如果没有保存的位置，使用默认视频左上角位置
+      setDefaultFloatingButtonPosition(localFloatingBtn);
     }
     // Position popup once floating button's position is set
     positionPopupRelativeToFloatingButton();
@@ -1731,7 +2381,6 @@ function createFloatingButton() {
     // A simple way: if mouseup just happened for this button, it was a drag.
     // However, click fires after mouseup. A more robust way is to check mouse movement.
     // For simplicity, we assume if isDraggingBtn is false, it's a click.
-    // The original code had `if (!isDragging)` which is similar.
     if (!isDraggingBtn) {
       e.stopPropagation();
       uiVisible = !uiVisible;
@@ -1749,9 +2398,30 @@ function createFloatingButton() {
   });
 
   document.body.appendChild(localFloatingBtn);
+  console.log("Floating button appended to body. Button style:", localFloatingBtn.style.cssText);
+  
+  // 添加可见性验证
+  setTimeout(() => {
+    const rect = localFloatingBtn.getBoundingClientRect();
+    const isVisible = rect.width > 0 && rect.height > 0;
+    console.log("Floating button visibility check:");
+    console.log("  - Bounding rect:", rect);
+    console.log("  - Is visible:", isVisible);
+    console.log("  - Display style:", window.getComputedStyle(localFloatingBtn).display);
+    console.log("  - Visibility style:", window.getComputedStyle(localFloatingBtn).visibility);
+    console.log("  - Z-index:", window.getComputedStyle(localFloatingBtn).zIndex);
+    
+    if (!isVisible) {
+      console.error("⚠️ 浮动按钮不可见！");
+      // 尝试强制设置样式
+      localFloatingBtn.style.display = "flex";
+      localFloatingBtn.style.visibility = "visible";
+      localFloatingBtn.style.opacity = "1";
+      console.log("Applied force visible styles");
+    } else {
+      console.log("✅ 浮动按钮可见");
+    }
+  }, 100);
+  
   return localFloatingBtn; // Return the created button
 }
-
-// --- Initialization order ---
-createPopup(); // Creates and appends popupDiv (initially hidden or unpositioned)
-floatingControlBtn = createFloatingButton(); // Creates, positions, and appends floatingBtn, and positions popupDiv
