@@ -49,6 +49,7 @@ let isLearn = false; // 是否处于语言学习模式
 let pausedForSubtitleId = null; // 记录因等待哪个字幕音频而暂停的ID
 let batchLoadingCanceled = false; // 控制批量加载是否被取消
 let batchLoadingInProgress = false; // 标记是否正在进行批量加载
+let isMuted = false; // 是否静音
 
 // 将关键变量暴露到window对象中，便于调试和测试
 window.batchLoadingCanceled = batchLoadingCanceled;
@@ -836,6 +837,11 @@ function createPopup() {
                <label for="hide-subtitle-bar">隐藏字幕栏</label>
                <span class="help-icon" title="勾选后,将隐藏视频上方的字幕栏显示">(?)</span>
              </div>
+             <div class="checkbox-container"> <!-- 新增：静音选项 -->
+              <input type="checkbox" id="mute-audio" name="mute-audio">
+              <label for="mute-audio">静音</label>
+              <span class="help-icon" title="勾选后,将静音生成的音频">(?)</span>
+            </div>
       <div class="current-subtitle" id="current-subtitle"></div>
       <div class="list-header">
         <h4>字幕列表</h4>
@@ -857,6 +863,7 @@ function createPopup() {
   const voiceSelect = shadowRoot.getElementById("voice-select"); // 获取语音选择下拉框
   const voiceConfigBtn = shadowRoot.getElementById("select-voice-config"); // 获取语音配置按钮
   const voiceConfigInput = shadowRoot.getElementById("voice-config-input"); // 获取语音配置文件输入
+  const muteAudioCheckbox = shadowRoot.getElementById("mute-audio"); // 获取静音复选框
 
   // 处理选择语音配置文件按钮点击
   voiceConfigBtn.addEventListener("click", () => {
@@ -1003,6 +1010,14 @@ function createPopup() {
       isLearn = false;
       isLearnBtn.checked = false;
     }
+    // 加载静音复选框状态
+    chrome.storage.local.get(["isMuted"], (result) => {
+      if (muteAudioCheckbox) {
+        muteAudioCheckbox.checked = result.isMuted || false;
+        // 根据存储的值更新实际的静音状态变量
+        isMuted = result.isMuted || false; 
+      }
+    });
   }
 
   // Call after shadowRoot elements are available
@@ -1044,6 +1059,17 @@ function createPopup() {
   if (isLearnBtn) {
     isLearnBtn.addEventListener("change", function () {
       isLearn = this.checked;
+    });
+  }
+
+  // 静音复选框事件监听器
+  if (muteAudioCheckbox) {
+    muteAudioCheckbox.addEventListener("change", function () {
+      isMuted = this.checked;
+      chrome.storage.local.set({ isMuted: isMuted });
+      if (isMuted && currentAudio) {
+        stopCurrentAudio(); // 如果勾选静音且有音频在播放，则停止
+      }
     });
   }
 
@@ -1930,6 +1956,7 @@ function loadAudio(subtitle) {
               );
               subtitle.audioStatus = "failed";
               updateSubtitleStatusUI(subtitle.id, "failed");
+              reject(e);
             }
           } else {
             console.error(
@@ -1937,6 +1964,7 @@ function loadAudio(subtitle) {
             );
             subtitle.audioStatus = "failed";
             updateSubtitleStatusUI(subtitle.id, "failed");
+            reject(new Error("Invalid response from audio generation service"));
           }
         }
 
@@ -1999,6 +2027,59 @@ function updateSubtitleStatusElement(element, status, subtitleId) {
 
 // 播放音频
 function playAudio(audioUrl, subtitleId, isSinglePlay) {
+  // 如果已静音，则不播放音频
+  if (isMuted) {
+    // 仍然高亮字幕，但不出声
+    highlightCurrentSubtitle(subtitleId);
+    // 如果有其他音频正在播放（理论上不应该，因为静音了），也停止它
+    if (currentAudio) {
+      currentAudio.pause();
+      currentAudio.currentTime = 0;
+      currentAudio = null;
+    }
+    // 模拟音频播放结束的逻辑，以便字幕可以继续（如果需要）
+    // 或者根据具体需求调整这里的行为
+    // 例如，如果静音时也希望视频按字幕节奏播放，可能需要其他机制
+    // 此处简单返回，不创建 Audio 对象
+    // 可以在 onended 逻辑中处理下一个字幕的播放（如果适用）
+    // 为了简单起见，我们假设静音时，字幕高亮后就结束了“播放”
+    // 如果有复杂的连续播放逻辑，这里需要更细致的处理
+    // 触发一个模拟的 onended 事件，或者直接调用处理 onended 的函数
+    // 确保在静音状态下，字幕的视觉同步（高亮）仍然发生
+    // 并且，如果应用依赖 onended 来推进，需要模拟这个过程
+    // 这里我们先简单处理，只高亮，不实际播放
+    // 如果有视频同步，视频速率调整等逻辑，也需要考虑是否在静音时执行
+    const subtitle = subtitles.find((sub) => sub.id === subtitleId);
+    if (subtitle && video) {
+        let targetRate = 1.0;
+        if (subtitle.playbackRate && typeof subtitle.playbackRate === 'number' && subtitle.playbackRate > 0) {
+            targetRate = subtitle.playbackRate;
+        }
+        video.playbackRate = Number(targetRate.toFixed(2));
+        if (!isLearn) {
+            // 非学习模式下，如果视频暂停了，则播放视频
+            if (video.paused) video.play().catch(e => console.error("Error playing video in muted mode:", e));
+        } else {
+            // 学习模式下，音频（静音）“播放”后，视频应该继续播放
+            video.play().catch(e => console.error("Error playing video in muted learn mode:", e));
+        }
+    }
+
+    // 模拟音频结束后的行为，以便字幕流程可以继续
+    // 这部分逻辑可能需要根据实际的 onended 处理来调整
+    setTimeout(() => {
+        highlightCurrentSubtitle(null); // 清除高亮
+        if (video) video.playbackRate = 1.0; // 重置速率
+        if (isSinglePlay && video) {
+            video.pause();
+        }
+        // 如果有连续播放逻辑，这里可能需要触发下一条字幕的处理
+        // 例如，手动调用 video 的 timeupdate 事件处理函数，或者其他机制
+    }, 1000); // 假设一个短暂的“播放”时间
+
+    return; 
+  }
+
   // --- 防止重复播放 ---
   if (currentAudio && currentAudio.src === audioUrl) {
     // console.log(`Audio ${subtitleId} is already playing or requested.`);
@@ -2053,6 +2134,7 @@ function playAudio(audioUrl, subtitleId, isSinglePlay) {
 
   currentAudio = new Audio(audioUrl);
   currentAudio.dataset.subtitleId = subtitleId; // 标记音频对应的字幕ID
+  currentAudio.muted = isMuted; // 根据静音状态设置音频的muted属性
 
   // 确保音频实际开始播放时再次同步视频速率
   currentAudio.onplay = () => {
