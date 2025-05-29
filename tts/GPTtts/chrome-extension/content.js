@@ -364,9 +364,9 @@ function positionSubtitleBar() {
       subtitleBar.style.position = "absolute";
       subtitleBar.style.zIndex = "999999";
       
-      // 全屏时，将字幕栏定位在屏幕底部上方50px位置
+      // 全屏时，将字幕栏定位在屏幕底部上方200px位置 (原为50px)
       const subtitleBarHeight = subtitleBar.offsetHeight || 100;
-      subtitleBar.style.top = `${window.innerHeight - 50 - subtitleBarHeight}px`;
+      subtitleBar.style.top = `${window.innerHeight - 200 - subtitleBarHeight}px`;
       
       // 全屏时字幕栏宽度为屏幕宽度的90%
       const subtitleBarWidth = window.innerWidth * 0.9;
@@ -390,9 +390,9 @@ function positionSubtitleBar() {
       
       const videoRect = video.getBoundingClientRect();
       
-      // 设置垂直位置：在视频底部上方50px处
+      // 设置垂直位置：在视频底部上方200px处 (原为50px)
       const subtitleBarHeight = subtitleBar.offsetHeight || 100;
-      subtitleBar.style.top = `${videoRect.bottom - 50 - subtitleBarHeight}px`;
+      subtitleBar.style.top = `${videoRect.bottom - 200 - subtitleBarHeight}px`;
 
       // 设置水平位置：相对视频宽度居中，宽度为视频宽度的90%
       const subtitleBarWidth = videoRect.width * 0.9;
@@ -426,6 +426,11 @@ function createSubtitleBar() {
   subtitleBar.style.gap = "5px";
   subtitleBar.style.cursor = "move";
   subtitleBar.style.userSelect = "none";
+
+  // 阻止字幕栏上的点击事件冒泡到视频，防止拖动字幕栏时暂停视频
+  subtitleBar.addEventListener('click', function(event) {
+    event.stopPropagation();
+  });
 
   // 第一行 - 播放速度和重置按钮
   const speedRow = document.createElement("div");
@@ -495,12 +500,12 @@ function createSubtitleBar() {
   const subtitleLine1 = document.createElement("div");
   subtitleLine1.id = "subtitle-line1";
   subtitleLine1.style.textAlign = "center";
-  subtitleLine1.style.fontSize = "2em";
+  subtitleLine1.style.fontSize = "3em"; // 字体大小扩大0.5倍 (原为2em)
 
   const subtitleLine2 = document.createElement("div");
   subtitleLine2.id = "subtitle-line2";
   subtitleLine2.style.textAlign = "center";
-  subtitleLine2.style.fontSize = "2em";
+  subtitleLine2.style.fontSize = "3em"; // 字体大小扩大0.5倍 (假设与第一行一致)
 
   subtitleBar.appendChild(speedRow);
   subtitleBar.appendChild(subtitleLine1);
@@ -1934,6 +1939,7 @@ function loadAudio(subtitle) {
             updateSubtitleStatusUI(subtitle.id, "failed");
           }
         }
+
       );
     }
   });
